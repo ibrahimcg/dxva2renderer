@@ -6,6 +6,8 @@
 #include <string>
 #include <dxva2api.h>
 #include <d3d9types.h>
+#include <d3dcompiler.h>
+
 
 #pragma comment(lib, "dxva2.lib")
 #define FOURCC_NV12 MAKEFOURCC('N', 'V', '1', '2')
@@ -14,34 +16,70 @@ template<typename T>
 T clamp(T value, T min, T max) {
     return value < min ? min : (value > max ? max : value);
 }
+#pragma comment(lib, "d3d9.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 
 class DXVA2Player {
 private:
     IDirect3D9* m_pD3D = nullptr;
     IDirect3DDevice9* m_pDevice = nullptr;
-    IDirect3DSurface9* m_pSurface = nullptr;
+    IDirect3DTexture9* m_pYTexture = nullptr;
+    IDirect3DTexture9* m_pUVTexture = nullptr;
+    IDirect3DVertexBuffer9* m_pVertexBuffer = nullptr;
+    IDirect3DPixelShader9* m_pPixelShader = nullptr;
     const int WIDTH = 640;
     const int HEIGHT = 360;
     std::ifstream m_file;
     std::vector<BYTE> m_frameBuffer;
-    std::vector<BYTE> m_rgbBuffer;
 
-    void YUVtoRGB(BYTE Y, BYTE U, BYTE V, BYTE& R, BYTE& G, BYTE& B) {
-        int C = Y - 16;
-        int D = U - 128;
-        int E = V - 128;
+    struct CUSTOMVERTEX {
+        float x, y, z;
+        float u, v;
+    };
+#define D3DFVF_CUSTOMVERTEX (D3DFVF_XYZ | D3DFVF_TEX1)
 
-        int R1 = (298 * C + 409 * E + 128) >> 8;
-        int G1 = (298 * C - 100 * D - 208 * E + 128) >> 8;
-        int B1 = (298 * C + 516 * D + 128) >> 8;
+    // Fixed shader code with proper HLSL syntax
+    const char* pixelShaderCode = R"(
+        texture2D YTexture;
+        texture2D UVTexture;
 
-        R = (BYTE)clamp(R1, 0, 255);
-        G = (BYTE)clamp(G1, 0, 255);
-        B = (BYTE)clamp(B1, 0, 255);
-    }
+        sampler2D YSampler = sampler_state {
+            Texture = <YTexture>;
+            MipFilter = NONE;
+            MinFilter = POINT;
+            MagFilter = POINT;
+        };
+
+        sampler2D UVSampler = sampler_state {
+            Texture = <UVTexture>;
+            MipFilter = NONE;
+            MinFilter = POINT;
+            MagFilter = POINT;
+        };
+
+        struct PS_INPUT {
+            float2 tex : TEXCOORD0;
+        };
+
+        float4 main(PS_INPUT input) : COLOR0
+        {
+            float Y = tex2D(YSampler, input.tex).r;
+            float2 UV = tex2D(UVSampler, input.tex).rg - 0.5;
+            
+            // BT.601 conversion matrix
+            float3 rgb;
+            rgb.r = Y + 1.13983 * UV.y;
+            rgb.g = Y - 0.39465 * UV.x - 0.58060 * UV.y;
+            rgb.b = Y + 2.03211 * UV.x;
+            
+            return float4(rgb, 1.0);
+        }
+    )";
+
 
 public:
     HRESULT Initialize(HWND hWnd, const std::string& filePath) {
+        // Create D3D device (similar to original code)
         m_pD3D = Direct3DCreate9(D3D_SDK_VERSION);
         if (!m_pD3D) return E_FAIL;
 
@@ -57,25 +95,78 @@ public:
             D3DADAPTER_DEFAULT,
             D3DDEVTYPE_HAL,
             hWnd,
-            D3DCREATE_SOFTWARE_VERTEXPROCESSING,
+            D3DCREATE_HARDWARE_VERTEXPROCESSING,
             &d3dpp,
             &m_pDevice
         );
         if (FAILED(hr)) return hr;
 
-        hr = m_pDevice->CreateOffscreenPlainSurface(
-            WIDTH,
-            HEIGHT,
-            D3DFMT_X8R8G8B8,
+        // Create textures for Y and UV planes
+        hr = m_pDevice->CreateTexture(WIDTH, HEIGHT, 1, 0, D3DFMT_L8, D3DPOOL_MANAGED, &m_pYTexture, NULL);
+        if (FAILED(hr)) return hr;
+
+        hr = m_pDevice->CreateTexture(WIDTH / 2, HEIGHT / 2, 1, 0, D3DFMT_A8L8, D3DPOOL_MANAGED, &m_pUVTexture, NULL);
+        if (FAILED(hr)) return hr;
+
+        // Create vertex buffer
+        CUSTOMVERTEX vertices[] = {
+            {-1.0f, 1.0f, 0.0f, 0.0f, 0.0f},
+            {1.0f, 1.0f, 0.0f, 1.0f, 0.0f},
+            {-1.0f, -1.0f, 0.0f, 0.0f, 1.0f},
+            {1.0f, -1.0f, 0.0f, 1.0f, 1.0f}
+        };
+
+        hr = m_pDevice->CreateVertexBuffer(
+            4 * sizeof(CUSTOMVERTEX),
+            0,
+            D3DFVF_CUSTOMVERTEX,
             D3DPOOL_DEFAULT,
-            &m_pSurface,
+            &m_pVertexBuffer,
             NULL
         );
+        if (FAILED(hr)) return hr;
+
+        void* pVertices;
+        hr = m_pVertexBuffer->Lock(0, sizeof(vertices), &pVertices, 0);
+        memcpy(pVertices, vertices, sizeof(vertices));
+        m_pVertexBuffer->Unlock();
+
+        // Compile and create pixel shader using D3DCompiler
+        ID3DBlob* pShaderBlob = nullptr;
+        ID3DBlob* pErrorBlob = nullptr;
+
+        hr = D3DCompile(
+            pixelShaderCode,
+            strlen(pixelShaderCode),
+            NULL,
+            NULL,
+            NULL,
+            "main",
+            "ps_2_0",
+            0,
+            0,
+            &pShaderBlob,
+            &pErrorBlob
+        );
+
+        if (FAILED(hr)) {
+            if (pErrorBlob) {
+                MessageBoxA(NULL, (char*)pErrorBlob->GetBufferPointer(), "Shader Compilation Error", MB_OK);
+                pErrorBlob->Release();
+            }
+            return hr;
+        }
+
+        hr = m_pDevice->CreatePixelShader(
+            (DWORD*)pShaderBlob->GetBufferPointer(),
+            &m_pPixelShader
+        );
+
+        pShaderBlob->Release();
+        if (pErrorBlob) pErrorBlob->Release();
 
         m_frameBuffer.resize(WIDTH * HEIGHT * 3 / 2);
-        m_rgbBuffer.resize(WIDTH * HEIGHT * 4);
         m_file.open(filePath, std::ios::binary);
-        if (!m_file.is_open()) return E_FAIL;
 
         return hr;
     }
@@ -85,38 +176,43 @@ public:
             return false;
         }
 
-        const BYTE* Y = m_frameBuffer.data();
-        const BYTE* UV = Y + (WIDTH * HEIGHT);
-
-        D3DLOCKED_RECT rect;
-        HRESULT hr = m_pSurface->LockRect(&rect, NULL, 0);
-        if (FAILED(hr)) return false;
-
-        BYTE* dst = static_cast<BYTE*>(rect.pBits);
+        // Update Y texture
+        D3DLOCKED_RECT yRect;
+        m_pYTexture->LockRect(0, &yRect, NULL, 0);
         for (int y = 0; y < HEIGHT; y++) {
-            for (int x = 0; x < WIDTH; x++) {
-                int uvIndex = (y / 2) * WIDTH + (x - (x % 2));
-                BYTE r, g, b;
-                YUVtoRGB(
-                    Y[y * WIDTH + x],
-                    UV[uvIndex],
-                    UV[uvIndex + 1],
-                    r, g, b
-                );
-
-                dst[y * rect.Pitch + x * 4 + 0] = b;
-                dst[y * rect.Pitch + x * 4 + 1] = g;
-                dst[y * rect.Pitch + x * 4 + 2] = r;
-                dst[y * rect.Pitch + x * 4 + 3] = 255;
-            }
+            memcpy(
+                (BYTE*)yRect.pBits + y * yRect.Pitch,
+                m_frameBuffer.data() + y * WIDTH,
+                WIDTH
+            );
         }
+        m_pYTexture->UnlockRect(0);
 
-        m_pSurface->UnlockRect();
+        // Update UV texture
+        D3DLOCKED_RECT uvRect;
+        m_pUVTexture->LockRect(0, &uvRect, NULL, 0);
+        const BYTE* uvPlane = m_frameBuffer.data() + (WIDTH * HEIGHT);
+        for (int y = 0; y < HEIGHT / 2; y++) {
+            memcpy(
+                (BYTE*)uvRect.pBits + y * uvRect.Pitch,
+                uvPlane + y * WIDTH,
+                WIDTH
+            );
+        }
+        m_pUVTexture->UnlockRect(0);
 
-        IDirect3DSurface9* pBackBuffer = nullptr;
-        m_pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pBackBuffer);
-        m_pDevice->StretchRect(m_pSurface, NULL, pBackBuffer, NULL, D3DTEXF_NONE);
-        pBackBuffer->Release();
+        // Render
+        m_pDevice->Clear(0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
+        m_pDevice->BeginScene();
+
+        m_pDevice->SetPixelShader(m_pPixelShader);
+        m_pDevice->SetTexture(0, m_pYTexture);
+        m_pDevice->SetTexture(1, m_pUVTexture);
+        m_pDevice->SetStreamSource(0, m_pVertexBuffer, 0, sizeof(CUSTOMVERTEX));
+        m_pDevice->SetFVF(D3DFVF_CUSTOMVERTEX);
+        m_pDevice->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+
+        m_pDevice->EndScene();
         m_pDevice->Present(NULL, NULL, NULL, NULL);
 
         return true;
@@ -124,11 +220,16 @@ public:
 
     ~DXVA2Player() {
         if (m_file.is_open()) m_file.close();
-        if (m_pSurface) m_pSurface->Release();
+        if (m_pPixelShader) m_pPixelShader->Release();
+        if (m_pVertexBuffer) m_pVertexBuffer->Release();
+        if (m_pYTexture) m_pYTexture->Release();
+        if (m_pUVTexture) m_pUVTexture->Release();
         if (m_pDevice) m_pDevice->Release();
         if (m_pD3D) m_pD3D->Release();
     }
 };
+
+
 
 int main() {
     std::string filePath;
@@ -177,7 +278,7 @@ int main() {
     }
 
     MSG msg = {};
-    DWORD frameTime = GetTickCount();
+    DWORD frameTime = GetTickCount64();
     const DWORD frameDelay = 33; // ~30fps
 
     while (true) {
@@ -187,7 +288,7 @@ int main() {
             DispatchMessage(&msg);
         }
 
-        DWORD currentTime = GetTickCount();
+        DWORD currentTime = GetTickCount64();
         if (currentTime - frameTime >= frameDelay) {
             if (!player.RenderNextFrame()) break;
             frameTime = currentTime;
