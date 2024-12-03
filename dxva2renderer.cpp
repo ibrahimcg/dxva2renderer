@@ -48,6 +48,8 @@ private:
             MipFilter = NONE;
             MinFilter = POINT;
             MagFilter = POINT;
+            AddressU = CLAMP;
+            AddressV = CLAMP;
         };
 
         sampler2D UVSampler = sampler_state {
@@ -55,6 +57,8 @@ private:
             MipFilter = NONE;
             MinFilter = POINT;
             MagFilter = POINT;
+            AddressU = CLAMP;
+            AddressV = CLAMP;
         };
 
         struct PS_INPUT {
@@ -63,15 +67,23 @@ private:
 
         float4 main(PS_INPUT input) : COLOR0
         {
+            // Sample YUV values
             float Y = tex2D(YSampler, input.tex).r;
-            float2 UV = tex2D(UVSampler, input.tex).rg - 0.5;
-            
-            // BT.601 conversion matrix
+            float2 UV = tex2D(UVSampler, input.tex).rg;
+    
+            // Simple range adjustment for limited range input
+            Y = (Y - 16.0/255.0);
+            UV -= 128.0/255.0;
+    
+            // BT.709 conversion matrix for HD content
             float3 rgb;
-            rgb.r = Y + 1.13983 * UV.y;
-            rgb.g = Y - 0.39465 * UV.x - 0.58060 * UV.y;
-            rgb.b = Y + 2.03211 * UV.x;
-            
+            rgb.r = Y + 1.5748 * UV.y;
+            rgb.g = Y - 0.1873 * UV.x - 0.4681 * UV.y;
+            rgb.b = Y + 1.8556 * UV.x;
+    
+            // Ensure we stay in valid range
+            rgb = saturate(rgb);
+    
             return float4(rgb, 1.0);
         }
     )";
